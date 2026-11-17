@@ -4,6 +4,7 @@ SwarTernaryKernel.jl
 Zero-dependency, zero-allocation (0 B) Julia twin of `8b-is/ultra-graph@918ef67`
 (`ternary_dot_packed`), packing 8 balanced ternary lanes {-1, 0, +1} into one Int64
 machine word and computing inner products via bitmasks + hardware `count_ones` (POPCNT).
+Includes a fail-closed continuous-to-SWAR ingress seam (`quantize_to_swar_word`).
 """
 
 module SwarTernaryKernel
@@ -15,6 +16,7 @@ export LANE_ONE,
        is_ternary_packed,
        pack_ternary,
        unpack_ternary,
+       quantize_to_swar_word,
        ternary_dot_packed
 
 const PACKED_LANES = 8
@@ -70,6 +72,31 @@ Unpack all 8 two's-complement byte lanes from `word` into an `NTuple{8, Int8}`.
     return ntuple(Val(8)) do i
         signed(UInt8((u >> (8 * (i - 1))) & 0xFF))
     end
+end
+
+"""
+    quantize_to_swar_word(v::NTuple{8, Float64}, threshold::Float64 = 0.25) -> Int64
+
+Ingress seam adapter that projects 8 continuous values into a packed 64-bit
+SWAR ternary word (`-1`, `0`, `+1` per byte lane) using a symmetric dead-zone
+threshold (`|x| <= threshold` maps to `0`). Fails closed on non-finite (`NaN`/`Inf`)
+floats or negative thresholds.
+"""
+@inline function quantize_to_swar_word(v::NTuple{8, Float64}, threshold::Float64 = 0.25)::Int64
+    if !isfinite(threshold) || threshold < 0.0
+        throw(ArgumentError("Threshold must be finite and non-negative, got $threshold"))
+    end
+    word = UInt64(0)
+    @inbounds for idx in 1:PACKED_LANES
+        val = v[idx]
+        if !isfinite(val)
+            throw(ArgumentError("Non-finite float at lane $idx rejected at SWAR seam: $val"))
+        end
+        trit = val > threshold ? Int64(1) : (val < -threshold ? Int64(-1) : Int64(0))
+        byte = reinterpret(UInt64, trit) & 0xFF
+        word |= byte << (8 * (idx - 1))
+    end
+    return reinterpret(Int64, word)
 end
 
 """
@@ -150,11 +177,22 @@ function run_parity_tests()
             @test ternary_dot_packed(pack_ternary(a_tup), pack_ternary(b_tup)) == sum(a_tup .* b_tup)
         end
 
-        # 4. Zero-allocation (0 B) verification after JIT warmup
+        # 4. Continuous-to-SWAR ingress seam & fail-closed NaN/Inf guards
+        vec_f64 = (0.85, -0.10, -0.72, 0.25, 0.90, 0.0, -0.30, 0.40)
+        q_word = quantize_to_swar_word(vec_f64, 0.25)
+        @test is_ternary_packed(q_word)
+        @test unpack_ternary(q_word) == Int8.((1, 0, -1, 0, 1, 0, -1, 1))
+        @test_throws ArgumentError quantize_to_swar_word((NaN, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0), 0.25)
+        @test_throws ArgumentError quantize_to_swar_word((Inf, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0), 0.25)
+        @test_throws ArgumentError quantize_to_swar_word((0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0), -0.1)
+
+        # 5. Zero-allocation (0 B) verification after JIT warmup
         wa = pack_ternary((1, -1, 1, 0, -1, 1, 1, -1))
         wb = pack_ternary((1, 1, -1, 0, -1, 1, -1, 1))
         ternary_dot_packed(wa, wb)
+        quantize_to_swar_word(vec_f64, 0.25)
         @test (@allocated ternary_dot_packed(wa, wb)) == 0
+        @test (@allocated quantize_to_swar_word(vec_f64, 0.25)) == 0
     end
 end
 
